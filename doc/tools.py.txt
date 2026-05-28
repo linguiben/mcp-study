@@ -1,0 +1,99 @@
+import platform
+import subprocess
+from pathlib import Path
+from typing import Any
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+MAX_COMMAND_OUTPUT_CHARS = 20_000
+
+
+def _truncate(text: str, max_chars: int = MAX_COMMAND_OUTPUT_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n\n[truncated: {len(text) - max_chars} chars omitted]"
+
+
+def _output_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _resolve_cwd(cwd: str) -> Path:
+    target = Path(cwd).expanduser()
+    if target.is_absolute():
+        resolved = target.resolve()
+    else:
+        resolved = (WORKSPACE_ROOT / target).resolve()
+
+    resolved.relative_to(WORKSPACE_ROOT)
+    return resolved
+
+
+def local_system_info() -> dict[str, str]:
+    """Get basic information about the local operating system."""
+    system_info = {
+        "system": platform.system(),
+        "node": platform.node(),
+        "release": platform.release(),
+        "version": platform.version(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "platform": platform.platform(),
+    }
+    return system_info
+
+
+def run_command(
+    command: list[str],
+    cwd: str = ".",
+    timeout_seconds: int = 60,
+) -> dict[str, Any]:
+    """Run a local command in the workspace.
+
+    Args:
+        command: Command and arguments, for example ["python", "-V"].
+        cwd: Working directory, relative to the project root or absolute within it.
+        timeout_seconds: Maximum execution time in seconds.
+    """
+    if not command:
+        raise ValueError("command must not be empty")
+    if any(not part for part in command):
+        raise ValueError("command parts must not be empty")
+    if timeout_seconds < 1:
+        raise ValueError("timeout_seconds must be greater than 0")
+
+    target_cwd = _resolve_cwd(cwd)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=target_cwd,
+            capture_output=True,
+            text=True,
+            timeout=min(timeout_seconds, 300),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": command,
+            "cwd": str(target_cwd),
+            "returncode": None,
+            "stdout": _truncate(_output_text(exc.stdout)),
+            "stderr": _truncate(_output_text(exc.stderr)),
+            "error": f"command timed out after {min(timeout_seconds, 300)} seconds",
+        }
+
+    return {
+        "command": command,
+        "cwd": str(target_cwd),
+        "returncode": completed.returncode,
+        "stdout": _truncate(completed.stdout),
+        "stderr": _truncate(completed.stderr),
+    }
+
+
+if __name__ == "__main__":
+    print(local_system_info())

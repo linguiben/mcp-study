@@ -1,0 +1,188 @@
+"""ADK sample agent with configurable Gemini/DeepSeek models and MCP tools."""
+
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+from google.adk.agents import Agent
+from google.adk.code_executors import UnsafeLocalCodeExecutor
+from google.adk.models.lite_llm import LiteLlm
+from google.adk.skills import Skill
+from google.adk.skills import load_skill_from_dir
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from google.adk.tools.skill_toolset import SkillToolset
+from mcp import StdioServerParameters
+
+from . import file_tools
+from . import tools
+
+logger = logging.getLogger(__name__)
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+USER_SKILLS_ROOT = Path.home() / ".agents" / "skills"
+PROJECT_SKILLS_ROOT = WORKSPACE_ROOT / ".agents" / "skills"
+DEFAULT_SKILLS_ROOTS = (USER_SKILLS_ROOT, PROJECT_SKILLS_ROOT)
+SKILLS_ROOTS_ENV = "AGENT_SKILLS_ROOTS"
+
+# npx may need to install the MCP filesystem server on the first run, so the
+# default 5-second MCP stdio startup timeout is too short.
+MCP_SERVER_STARTUP_TIMEOUT = 60.0
+CODE_EXECUTION_TIMEOUT_SECONDS = 60
+
+# Use a native Gemini model name by default. Set this to a LiteLLM provider
+# model such as deepseek/deepseek-v4-flash to route calls through LiteLLM.
+ADK_AGENT_MODEL = os.getenv("ADK_AGENT_MODEL", "gemini-3.1-flash-lite")
+
+
+def exclude_model_dump_field(exclude: Any, field_name: str) -> Any:
+    """Merge a field into pydantic's flexible model_dump exclude option."""
+    if exclude is None:
+        return {field_name}
+    if isinstance(exclude, set):
+        return exclude | {field_name}
+    if isinstance(exclude, dict):
+        return {**exclude, field_name: True}
+    return exclude
+
+
+class SerializableLiteLlm(LiteLlm):
+    """LiteLlm variant safe for ADK Web graph JSON serialization."""
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        # ADK Web's build_graph endpoint dumps agent fields and then serializes
+        # them as JSON. LiteLlm's internal client is runtime-only and cannot be
+        # JSON serialized, so keep it out of metadata responses.
+        kwargs["exclude"] = exclude_model_dump_field(
+            kwargs.get("exclude"), "llm_client"
+        )
+        return super().model_dump(*args, **kwargs)
+
+
+def resolve_model(model_name: str) -> str | SerializableLiteLlm:
+    """Return the ADK model object for the configured model name."""
+    # ADK accepts Gemini model names directly. Non-Google providers need the
+    # LiteLLM adapter, using LiteLLM's provider/model naming convention.
+    if model_name.startswith("deepseek/"):
+        return SerializableLiteLlm(model=model_name)
+    return model_name
+
+
+def configured_skill_roots() -> list[Path]:
+    """Return skill roots used to load ADK Agent Skills."""
+    configured = os.getenv(SKILLS_ROOTS_ENV)
+    if configured:
+        candidates = [
+            Path(part.strip()).expanduser()
+            for part in configured.split(os.pathsep)
+            if part.strip()
+        ]
+    else:
+        candidates = list(DEFAULT_SKILLS_ROOTS)
+
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        root = candidate.resolve()
+        if root in seen:
+            continue
+        seen.add(root)
+        roots.append(root)
+    return roots
+
+
+def load_installed_adk_skills() -> list[Skill]:
+    """Load ADK Agent Skills from configured local skill roots."""
+    skills_by_name: dict[str, Skill] = {}
+    roots = configured_skill_roots()
+
+    for skills_root in roots:
+        if not skills_root.is_dir():
+            logger.info("ADK skills root missing; root=%s", skills_root)
+            continue
+
+        skill_dirs = sorted(path for path in skills_root.iterdir() if path.is_dir())
+        for skill_dir in skill_dirs:
+            skill_file = skill_dir / "SKILL.md"
+            if not skill_file.is_file():
+                continue
+
+            try:
+                skill = load_skill_from_dir(skill_dir)
+            except Exception as exc:
+                logger.warning(
+                    "ADK skill skipped; dir=%s error=%s",
+                    skill_dir,
+                    exc,
+                )
+                continue
+
+            # Later roots intentionally win. With the default order this lets a
+            # project skill override a user-level skill of the same name.
+            skills_by_name[skill.name] = skill
+
+    logger.info(
+        "ADK skills loaded; count=%d roots=%s skills=%s",
+        len(skills_by_name),
+        ", ".join(str(root) for root in roots),
+        ", ".join(sorted(skills_by_name)) or "none",
+    )
+    return list(skills_by_name.values())
+
+
+local_code_executor = UnsafeLocalCodeExecutor(
+    timeout_seconds=CODE_EXECUTION_TIMEOUT_SECONDS
+)
+adk_skill_toolset = SkillToolset(
+    skills=load_installed_adk_skills(),
+    code_executor=local_code_executor,
+    script_timeout=CODE_EXECUTION_TIMEOUT_SECONDS,
+)
+
+
+# ADK discovers this variable when running `adk run`, `adk web`, or
+# `adk api_server`.
+root_agent = Agent(
+    name="adk_agent",
+    model=resolve_model(ADK_AGENT_MODEL),
+    instruction=(
+        "You are a helpful AI assistant. Use the available tools when they "
+        "help answer questions about the local system, workspace files, "
+        "local command output, code execution, or specialized tasks covered "
+        "by installed Agent Skills."
+    ),
+    description=(
+        "AI sample agent with local system tools, filesystem MCP tools, "
+        "and ADK Agent Skills."
+    ),
+    tools=[
+        tools.local_system_info,
+        file_tools.get_workspace_root,
+        file_tools.list_files,
+        file_tools.read_file,
+        file_tools.write_file,
+        tools.run_command,
+        adk_skill_toolset,
+        McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command="npx",
+                    args=[
+                        "--yes",
+                        "--loglevel=error",
+                        "--package",
+                        "@modelcontextprotocol/server-filesystem@2026.1.14",
+                        "mcp-server-filesystem",
+                        # Limit filesystem MCP access to this repository.
+                        str(WORKSPACE_ROOT),
+                    ],
+                ),
+                timeout=MCP_SERVER_STARTUP_TIMEOUT,
+            ),
+            tool_name_prefix="mcp",
+        ),
+    ],
+    code_executor=local_code_executor,
+)
+

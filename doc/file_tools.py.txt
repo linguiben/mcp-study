@@ -1,0 +1,114 @@
+from collections.abc import Iterator
+from pathlib import Path
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_filesystem_path(path: str) -> Path:
+    target = Path(path).expanduser()
+    if target.is_absolute():
+        return target.resolve()
+    return (WORKSPACE_ROOT / target).resolve()
+
+
+def _walk_filesystem(root: Path) -> Iterator[Path]:
+    pending = [root]
+    while pending:
+        current = pending.pop(0)
+        try:
+            children = sorted(current.iterdir())
+        except (OSError, PermissionError):
+            continue
+
+        for child in children:
+            yield child
+            if child.is_dir():
+                pending.append(child)
+
+
+def _display_path(path: Path) -> str:
+    try:
+        value = path.relative_to(WORKSPACE_ROOT).as_posix()
+    except ValueError:
+        value = path.as_posix()
+    if path.is_dir() and value not in {".", "/"}:
+        value += "/"
+    return value or "."
+
+
+def get_workspace_root() -> str:
+    """Return the project directory used to resolve relative file paths."""
+    return str(WORKSPACE_ROOT)
+
+
+def list_files(
+    path: str = ".",
+    recursive: bool = False,
+    max_entries: int = 200,
+) -> list[str]:
+    """List files and directories from any readable filesystem path.
+
+    Args:
+        path: Absolute path, or relative path resolved from the project directory.
+        recursive: Whether to list nested files and directories.
+        max_entries: Maximum number of entries to return.
+    """
+    if max_entries < 1:
+        raise ValueError("max_entries must be greater than 0")
+
+    target = _resolve_filesystem_path(path)
+    if not target.exists():
+        raise FileNotFoundError(path)
+    if target.is_file():
+        return [_display_path(target)]
+
+    entries: list[Path] = []
+    if recursive:
+        for child in _walk_filesystem(target):
+            entries.append(child)
+            if len(entries) >= max_entries:
+                break
+    else:
+        entries = sorted(target.iterdir())[:max_entries]
+
+    return [_display_path(entry) for entry in entries]
+
+
+def read_file(path: str, max_chars: int = 20_000) -> str:
+    """Read a UTF-8 text file from any filesystem path.
+
+    Args:
+        path: Absolute path, or relative path resolved from the project directory.
+        max_chars: Maximum number of characters to return.
+    """
+    if max_chars < 1:
+        raise ValueError("max_chars must be greater than 0")
+
+    target = _resolve_filesystem_path(path)
+    if not target.is_file():
+        raise FileNotFoundError(path)
+
+    text = target.read_text(encoding="utf-8")
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n\n[truncated: {len(text) - max_chars} chars omitted]"
+
+
+def write_file(path: str, content: str, overwrite: bool = False) -> str:
+    """Write UTF-8 text to any filesystem path.
+
+    Args:
+        path: Absolute path, or relative path resolved from the project directory.
+        content: Text content to write.
+        overwrite: Whether to replace an existing file.
+    """
+    target = _resolve_filesystem_path(path)
+    if target.exists() and target.is_dir():
+        raise IsADirectoryError(path)
+    if target.exists() and not overwrite:
+        raise FileExistsError(f"{path} already exists; set overwrite=True to replace it")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"wrote {_display_path(target)} ({len(content)} chars)"

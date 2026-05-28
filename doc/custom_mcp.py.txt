@@ -1,0 +1,19 @@
+"""Compatibility helpers for Streamable HTTP MCP toolsets.
+
+ADK 2.x already supports ``httpx_client_factory`` on
+``StreamableHTTPConnectionParams``, so no custom session manager is needed.
+The classes below keep older imports from this sample working.
+"""
+
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import (
+    StreamableHTTPConnectionParams,
+)
+
+
+class CustomStreamableHTTPConnectionParams(StreamableHTTPConnectionParams):
+    """Streamable HTTP connection params with custom HTTPX client support."""
+
+
+class CustomMCPToolset(McpToolset):
+    """Compatibility alias for old sample code."""
